@@ -9,4 +9,11 @@ if len(sys.argv) != 3 or sys.argv[1] not in {"start", "stop", "restart", "enable
 action, server_id = sys.argv[1:]
 if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,31}", server_id):
     raise SystemExit("invalid server id")
-subprocess.run(["/usr/bin/systemctl", action, f"minecraft@{server_id}.service"], check=True)
+command = ["/usr/bin/systemctl"]
+if action in {"start", "stop", "restart"}:
+    # Lifecycle requests must return immediately. The dashboard polls systemd
+    # and streams logs while the operation completes; waiting here used to hit
+    # the dashboard's 15-second helper timeout during normal Minecraft saves.
+    command.append("--no-block")
+command.extend([action, f"minecraft@{server_id}.service"])
+subprocess.run(command, check=True)

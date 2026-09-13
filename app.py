@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import struct
 import subprocess
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -358,17 +359,18 @@ def _status(row: sqlite3.Row) -> dict[str, Any]:
     install_state = row["install_state"] if "install_state" in row.keys() else "ready"
     failed = state == "failed" or substate in {"failed", "auto-restart"} or install_state in {"failed", "repair_required"}
     preparing = install_state in {"queued", "provisioning"}
+    transitioning = state in {"activating", "deactivating"}
     allowed_actions = {
-        "start": not running and not preparing and install_state == "ready",
+        "start": state in {"inactive", "failed"} and not preparing and install_state == "ready",
         # Stop must remain possible while a unit is activating or crashing.
         "stop": state in {"active", "activating", "deactivating", "failed"} or substate in {"running", "start", "auto-restart", "failed"},
-        "restart": not preparing and install_state == "ready",
+        "restart": not transitioning and not preparing and install_state == "ready",
         "repair": failed or install_state == "repair_required",
-        "delete": not running and not preparing,
+        "delete": state == "inactive" and not preparing,
     }
     return {
         **dict(row), "running": running, "state": state, "substate": substate,
-        "lifecycle": "provisioning" if preparing else "failed" if failed else "running" if running else "stopped",
+        "lifecycle": "provisioning" if preparing else "failed" if failed else "starting" if state == "activating" else "stopping" if state == "deactivating" else "running" if running else "stopped",
         "allowed_actions": allowed_actions,
         "uptime_seconds": uptime_seconds, "players_online": online,
         "players_max": maximum, "players_available": online is not None,
@@ -546,7 +548,7 @@ def _download_artifact(artifact: dict[str, Any], destination: Path) -> None:
 def _create_files(config: dict[str, Any], instance: Path | None = None) -> None:
     instance = instance or _instance_dir(config["id"])
     instance.mkdir(parents=True, exist_ok=False)
-    for child in ("mods", "logs", "backups"):
+    for child in ("mods", "plugins", "logs", "backups"):
         (instance / child).mkdir()
     (instance / "eula.txt").write_text("eula=true\n", encoding="utf-8")
     properties = {key: str(meta["default"]) for key, meta in PROPERTY_FIELDS.items()}
@@ -596,11 +598,20 @@ async def _wait_stopped(server_id: str) -> bool:
     return not _status(_server_row(server_id))["running"]
 
 
+def _addon_root(server_id: str) -> tuple[Path, str]:
+    row = _server_row(server_id)
+    software = row["software"]
+    if software == "vanilla":
+        raise HTTPException(status_code=409, detail="Vanilla servers do not load plugin or mod JARs")
+    folder = "plugins" if software == "paper" else "mods"
+    return (_instance_dir(server_id) / folder).resolve(), "Plugin" if folder == "plugins" else "Mod"
+
+
 def _mod_path(server_id: str, filename: str) -> Path:
     name = Path(filename).name
     if not name or name != filename or name.startswith(".") or len(name) > 180 or "\x00" in name or not name.lower().endswith(".jar"):
         raise HTTPException(status_code=400, detail="Only a plain .jar filename is allowed")
-    root = (_instance_dir(server_id) / "mods").resolve()
+    root, _ = _addon_root(server_id)
     path = (root / name).resolve()
     if path.parent != root:
         raise HTTPException(status_code=400, detail="Invalid mod path")
@@ -676,7 +687,7 @@ def _save_properties(server_id: str, values: dict[str, str]) -> None:
 
 
 def _mods(server_id: str) -> list[dict[str, Any]]:
-    root = _instance_dir(server_id) / "mods"
+    root, _ = _addon_root(server_id)
     if not root.exists():
         return []
     result = []
@@ -685,6 +696,62 @@ def _mods(server_id: str) -> list[dict[str, Any]]:
             stat = path.stat()
             result.append({"filename": path.name, "bytes": stat.st_size, "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")})
     return result
+
+
+def _backup_root(server_id: str) -> Path:
+    instance = _instance_dir(server_id)
+    root = (instance / "backups").resolve()
+    if root.parent != instance.resolve():
+        raise HTTPException(status_code=400, detail="Invalid backup directory")
+    return root
+
+
+def _backup_path(server_id: str, filename: str) -> Path:
+    name = Path(filename).name
+    if name != filename or not re.fullmatch(r"backup-[0-9]{8}-[0-9]{6}(?:-[a-f0-9]{6})?\.tar\.gz", name):
+        raise HTTPException(status_code=400, detail="Invalid backup name")
+    root = _backup_root(server_id)
+    path = (root / name).resolve()
+    if path.parent != root:
+        raise HTTPException(status_code=400, detail="Invalid backup path")
+    return path
+
+
+def _backups(server_id: str) -> list[dict[str, Any]]:
+    root = _backup_root(server_id)
+    if not root.exists():
+        return []
+    result = []
+    for path in sorted(root.glob("backup-*.tar.gz"), key=lambda item: item.stat().st_mtime, reverse=True):
+        if path.is_file() and not path.is_symlink():
+            info = path.stat()
+            result.append({"filename": path.name, "bytes": info.st_size, "created_at": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(timespec="seconds")})
+    return result
+
+
+def _create_backup(server_id: str) -> dict[str, Any]:
+    instance = _instance_dir(server_id)
+    root = _backup_root(server_id)
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filename = f"backup-{stamp}-{uuid.uuid4().hex[:6]}.tar.gz"
+    destination = root / filename
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=root, prefix=".backup-", delete=False) as temp:
+            temp_path = Path(temp.name)
+        with tarfile.open(temp_path, "w:gz") as archive:
+            for child in instance.iterdir():
+                if child.name in {"backups", "logs", "console.in"} or child.is_fifo():
+                    continue
+                archive.add(child, arcname=child.name, recursive=True)
+        os.chmod(temp_path, 0o640)
+        os.replace(temp_path, destination)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+    info = destination.stat()
+    return {"filename": filename, "bytes": info.st_size, "created_at": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(timespec="seconds")}
 
 
 def _log_read(path: Path, position: int) -> tuple[str, int]:
@@ -1011,17 +1078,20 @@ async def server_action(server_id: str, action: str) -> dict[str, Any]:
 
 @app.get("/api/servers/{server_id}/mods")
 async def list_mods(server_id: str) -> dict[str, Any]:
-    _server_row(server_id)
-    return {"mods": await asyncio.to_thread(_mods, server_id)}
+    root, label = await asyncio.to_thread(_addon_root, server_id)
+    return {"mods": await asyncio.to_thread(_mods, server_id), "kind": label.lower(), "folder": root.name}
 
 
 @app.post("/api/servers/{server_id}/mods")
 async def upload_mod(server_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
-    _server_row(server_id)
+    row = _server_row(server_id)
+    if (await asyncio.to_thread(_status, row))["running"]:
+        raise HTTPException(status_code=409, detail="Stop the server before changing plugins or mods")
+    _, label = await asyncio.to_thread(_addon_root, server_id)
     destination = _mod_path(server_id, file.filename or "")
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
-        raise HTTPException(status_code=409, detail="A mod with that filename already exists")
+        raise HTTPException(status_code=409, detail=f"A {label.lower()} with that filename already exists")
     total = 0
     temp_path: Path | None = None
     try:
@@ -1030,7 +1100,7 @@ async def upload_mod(server_id: str, file: UploadFile = File(...)) -> dict[str, 
             while chunk := await file.read(1024 * 1024):
                 total += len(chunk)
                 if total > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Mod file is too large")
+                    raise HTTPException(status_code=413, detail=f"{label} file is too large")
                 temp.write(chunk)
             os.chmod(temp_path, 0o640)
         os.replace(temp_path, destination)
@@ -1038,17 +1108,44 @@ async def upload_mod(server_id: str, file: UploadFile = File(...)) -> dict[str, 
         await file.close()
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
-    return {"ok": True, "mod": {"filename": destination.name, "bytes": total}}
+    return {"ok": True, "kind": label.lower(), "mod": {"filename": destination.name, "bytes": total}}
 
 
 @app.delete("/api/servers/{server_id}/mods/{filename}")
 async def delete_mod(server_id: str, filename: str) -> dict[str, Any]:
-    _server_row(server_id)
+    row = _server_row(server_id)
+    if (await asyncio.to_thread(_status, row))["running"]:
+        raise HTTPException(status_code=409, detail="Stop the server before changing plugins or mods")
     path = _mod_path(server_id, filename)
     if not path.exists() or path.is_symlink() or not path.is_file():
-        raise HTTPException(status_code=404, detail="Mod not found")
+        raise HTTPException(status_code=404, detail="Plugin or mod not found")
     await asyncio.to_thread(path.unlink)
     return {"ok": True, "message": f"Deleted {path.name}"}
+
+
+@app.get("/api/servers/{server_id}/backups")
+async def list_backups(server_id: str) -> dict[str, Any]:
+    _server_row(server_id)
+    return {"backups": await asyncio.to_thread(_backups, server_id)}
+
+
+@app.post("/api/servers/{server_id}/backups")
+async def create_backup(server_id: str) -> dict[str, Any]:
+    async with SERVER_LOCKS.setdefault(server_id, asyncio.Lock()):
+        row = _server_row(server_id)
+        if (await asyncio.to_thread(_status, row))["running"]:
+            raise HTTPException(status_code=409, detail="Stop the server before creating a backup")
+        backup = await asyncio.to_thread(_create_backup, server_id)
+    return {"ok": True, "message": "Backup created", "backup": backup}
+
+
+@app.get("/api/servers/{server_id}/backups/{filename}")
+async def download_backup(server_id: str, filename: str) -> FileResponse:
+    _server_row(server_id)
+    path = _backup_path(server_id, filename)
+    if not path.exists() or path.is_symlink() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Backup not found")
+    return FileResponse(path, filename=path.name, media_type="application/gzip")
 
 
 @app.get("/api/servers/{server_id}/properties")

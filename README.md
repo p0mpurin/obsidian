@@ -2,7 +2,7 @@
 
 Obsidian is a single-page FastAPI dashboard for creating and managing multiple isolated Minecraft server instances on one Debian host. The interface is deliberately monochrome: black OLED canvas, grayscale surfaces, soft white status glow.
 
-The server overview shows a copyable Java Edition address, explicit start/stop progress, and a live console backed by the per-instance FIFO. Console commands are sent directly to the selected Minecraft process. The interface uses the configured star-field YouTube embed as a muted background; browsers with reduced-motion enabled receive the static dark fallback.
+The server overview shows a copyable Java Edition address, explicit start/stop progress, and a live console backed by the per-instance FIFO. Console commands are sent directly to the selected Minecraft process. The management area provides validated `server.properties` controls, Paper plugin and Fabric mod uploads, plus downloadable world snapshots. Add-ons and backups require the selected server to be stopped so files remain consistent. The interface uses the configured star-field YouTube embed as a muted background; browsers with reduced-motion enabled receive the static dark fallback.
 
 ## Install and update from GitHub
 
@@ -81,6 +81,8 @@ If `setfacl` is not installed, install the Debian `acl` package first. Set `MC_D
 The dashboard accepts the Minecraft EULA in its create form and writes `eula=true` into the new instance automatically; no manual server-file edit is required. The service listens on `127.0.0.1` by default. To visit it directly from another device on the same network, set `MC_DASHBOARD_HOST=0.0.0.0` in `.env`, then reload the service and open `http://<server-ip>:18080`. Because this control panel can start services and execute console commands, use a VPN or authenticated reverse proxy before exposing it beyond a trusted LAN.
 
 The helper accepts only a validated server id and a small fixed set of systemd actions. The dashboard never gets unrestricted shell or systemctl access. The template unit’s Java memory values are defaults; update the unit or extend the generated per-instance configuration if you need each server’s RAM values to be honored.
+
+Lifecycle helper calls use systemd's non-blocking mode. The API returns as soon as systemd accepts start, stop, or restart, while the page continues polling status and streaming console output. This prevents normal world-save shutdowns from being reported as 15-second helper failures.
 
 The dashboard service must be allowed to use its restricted `sudo` helper, so do not enable `NoNewPrivileges=true` on `minecraft-dashboard.service`; the helper and `/etc/sudoers.d/minecraft-dashboard` provide the privilege boundary instead.
 

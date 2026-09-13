@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import tarfile
 import uuid
 from pathlib import Path
 
@@ -61,6 +62,32 @@ def main() -> None:
         assert server["install_state"] == "ready", server
         assert server["allowed_actions"]["start"] is True, server
         assert (app._instance_dir(config["id"]) / "eula.txt").read_text(encoding="utf-8") == "eula=true\n"
+
+        properties = app._validate_properties(config["id"], {"difficulty": "hard", "max-players": "42", "pvp": "false"})
+        app._save_properties(config["id"], properties)
+        assert app._read_properties(config["id"])["max-players"] == "42"
+
+        db = app._db()
+        db.execute("UPDATE servers SET software = 'paper' WHERE id = ?", (config["id"],))
+        db.commit()
+        db.close()
+        addon_root, addon_kind = app._addon_root(config["id"])
+        assert addon_root.name == "plugins"
+        assert addon_kind == "Plugin"
+        (addon_root / "example.jar").write_bytes(b"test plugin")
+        assert app._mods(config["id"])[0]["filename"] == "example.jar"
+
+        backup = app._create_backup(config["id"])
+        assert app._backups(config["id"])[0]["filename"] == backup["filename"]
+        with tarfile.open(app._backup_path(config["id"], backup["filename"]), "r:gz") as archive:
+            assert "plugins/example.jar" in archive.getnames()
+
+        original_systemd_properties = app._systemd_properties
+        app._systemd_properties = lambda _server_id: {"ActiveState": "deactivating", "SubState": "stop-sigint", "ActiveEnterTimestampMonotonic": "0"}
+        stopping = app._status(app._server_row(config["id"]))
+        app._systemd_properties = original_systemd_properties
+        assert stopping["lifecycle"] == "stopping"
+        assert stopping["allowed_actions"]["delete"] is False
         print("smoke check passed")
     finally:
         shutil.rmtree(ROOT, ignore_errors=True)
