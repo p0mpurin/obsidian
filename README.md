@@ -2,6 +2,8 @@
 
 Obsidian is a single-page FastAPI dashboard for creating and managing multiple isolated Minecraft server instances on one Debian host. The interface is deliberately monochrome: black OLED canvas, grayscale surfaces, soft white status glow.
 
+The server overview shows a copyable Java Edition address, explicit start/stop progress, and a live console backed by the per-instance FIFO. Console commands are sent directly to the selected Minecraft process. The interface uses the configured star-field YouTube embed as a muted background; browsers with reduced-motion enabled receive the static dark fallback.
+
 ## Install and update from GitHub
 
 Clone the repository once on the Debian server, then run the installer:
