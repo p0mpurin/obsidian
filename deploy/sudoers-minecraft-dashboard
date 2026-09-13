@@ -1,0 +1,2 @@
+# Install the root-owned helper as /usr/local/sbin/minecraft-dashboard-ctl.
+minecraft-dashboard ALL=(root) NOPASSWD: /usr/local/sbin/minecraft-dashboard-ctl

@@ -1,0 +1,17 @@
+[Unit]
+Description=Minecraft Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=minecraft-dashboard
+Group=minecraft
+WorkingDirectory=/opt/minecraftdash
+EnvironmentFile=/opt/minecraftdash/.env
+ExecStart=/bin/sh -c 'exec /opt/minecraftdash/.venv/bin/uvicorn app:app --host "$$MC_DASHBOARD_HOST" --port "$$MC_DASHBOARD_PORT"'
+Restart=on-failure
+RestartSec=3
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

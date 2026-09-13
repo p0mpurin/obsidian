@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+server_id=$1
+root_dir=${MC_ROOT_DIR:-/srv/minecraft}
+instance="$root_dir/instances/$server_id"
+fifo="$instance/console.in"
+
+if [ ! -r "$instance/server.jar" ]; then
+    echo "Server setup incomplete: $instance/server.jar is missing or unreadable by the minecraft service account." >&2
+    exit 78
+fi
+
+if [ -f "$instance/server.env" ]; then
+    # The dashboard owns this generated file; it only contains RAM settings.
+    . "$instance/server.env"
+fi
+
+if [ ! -p "$fifo" ]; then
+    rm -f "$fifo"
+    mkfifo "$fifo"
+    chmod 660 "$fifo"
+fi
+
+# Keep both ends open in this process so Java can start without blocking and
+# dashboard commands can continue to be delivered to Java's stdin.
+exec 3<>"$fifo"
+
+cd "$instance"
+exec /usr/bin/java \
+    -Xms"${MC_MIN_RAM:-1G}" \
+    -Xmx"${MC_MAX_RAM:-2G}" \
+    -jar "$instance/server.jar" nogui <&3 >>"$instance/logs/latest.log" 2>&1

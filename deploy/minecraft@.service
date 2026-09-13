@@ -1,0 +1,22 @@
+[Unit]
+Description=Minecraft server instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+WorkingDirectory=/
+EnvironmentFile=-/opt/minecraftdash/.env
+ExecStart=/usr/local/libexec/minecraft-server-wrapper %i
+StandardOutput=journal
+StandardError=inherit
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
